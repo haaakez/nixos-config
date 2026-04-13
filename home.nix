@@ -8,4 +8,5 @@
   home.file.".config/noctalia".source = ./noctalia;
   home.file.".config/kitty".source = ./kitty;
   home.file.".config/spicetify".source = ./spicetify;
+  home.file."Pictures/Wallpapers/wallpaper.jpg".source = ./wallpaper.jpg;
 }
