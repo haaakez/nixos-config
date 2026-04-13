@@ -10,7 +10,6 @@
     ];
   nix.settings.experimental-features = [ "nix-command" "flakes" ];
 
-};
 systemd.user.services.pipewire-restart = {
   description = "Restart pipewire before Steam";
   wantedBy = [ "default.target" ];
