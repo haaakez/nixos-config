@@ -8,5 +8,4 @@
   home.file.".config/noctalia".source = ./noctalia;
   home.file.".config/kitty".source = ./kitty;
   home.file.".config/spicetify".source = ./spicetify;
-  home.file.".config/fastfetch".source = ./fastfetch;
 }
