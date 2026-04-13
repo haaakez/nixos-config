@@ -40,7 +40,7 @@
         system = "x86_64-linux";
         specialArgs = { inherit inputs; };
         modules = [
-          ./notnvidia/hardware-configuration.nix
+          /etc/nixos/hardware-configuration.nix
           ./notnvidia/configuration.nix
           home-manager.nixosModules.home-manager
           {
