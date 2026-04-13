@@ -8,5 +8,5 @@
   home.file.".config/noctalia".source = ./noctalia;
   home.file.".config/kitty".source = ./kitty;
   home.file.".config/spicetify".source = ./spicetify;
-  home.file."Pictures/Wallpapers/wallpaper.png".source = ./wallpaper.png;
+  home.file."Pictures/Wallpapers/wFreeSample-Vectorizer-io-images.steamusercontent(1).png".source = ./wallpaper.png;
 }
