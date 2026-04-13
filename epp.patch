@@ -1,0 +1,312 @@
+diff --git a/meson.build b/meson.build
+index b4548541..2b76a726 100644
+--- a/meson.build
++++ b/meson.build
+@@ -369,6 +369,7 @@ src_libfilter = [
+ 		'src/filter-flat.c',
+ 		'src/filter-low-dpi.c',
+ 		'src/filter-mouse.c',
++		'src/filter-epp.c',
+ 		'src/filter-touchpad.c',
+ 		'src/filter-touchpad-flat.c',
+ 		'src/filter-touchpad-x230.c',
+diff --git a/src/evdev.c b/src/evdev.c
+index c08d0291..8c676fa3 100644
+--- a/src/evdev.c
++++ b/src/evdev.c
+@@ -1134,9 +1134,7 @@ evdev_init_accel(struct evdev_device *device, enum libinput_config_accel_profile
+ 	}
+ 
+ 	if (!filter)
+-		filter = create_pointer_accelerator_filter_linear(
+-			device->dpi,
+-			device->use_velocity_averaging);
++		filter = create_pointer_accelerator_filter_epp();
+ 
+ 	if (!filter)
+ 		return false;
+diff --git a/src/filter-epp.c b/src/filter-epp.c
+new file mode 100644
+index 00000000..54f9e712
+--- /dev/null
++++ b/src/filter-epp.c
+@@ -0,0 +1,249 @@
++#include "config.h"
++
++#include <math.h>
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "filter-private.h"
++#include "filter.h"
++
++/*
++ * Windows defaults.
++ */
++
++static const int64_t smooth_mouse_x_curve[5] = { 0x0,
++						 0x6e15,
++						 0x14000,
++						 0x3dc29,
++						 0x280000 };
++
++static const int64_t smooth_mouse_y_curve[5] = { 0x0,
++						 0x111fd,
++						 0x42400,
++						 0x12fc00,
++						 0x1bbc000 };
++
++#define DEFAULT_DISPLAY_DPI 96
++#define DEFAULT_WINDOWS_SENS 10
++
++struct pointer_accelerator_epp {
++	struct motion_filter base;
++	int64_t x_scaled[5];
++	int64_t y_scaled[5];
++	int64_t slopes[4];
++	int64_t y_intercepts[4];
++
++	int64_t x_accum;
++	int64_t y_accum;
++	int64_t prev_idx;
++};
++
++/**
++ * Builds the acceleration curve.
++ * Same as win32kbase!CDeviceAcceleration::_BuildAccelerationCurve
++ *
++ * @param filter The acceleration filter
++ * @param display_dpi Display dpi, currently defaults to 96 ( scaling not implemented )
++ * @param sens Windows sens 1-20
++ */
++static void
++build_pointer_accelerator_curve_epp(struct pointer_accelerator_epp *filter,
++				    uint8_t display_dpi,
++				    const uint8_t sens)
++{
++	if (display_dpi < DEFAULT_DISPLAY_DPI)
++		display_dpi = DEFAULT_DISPLAY_DPI;
++
++	const int64_t dpi_factor = ((int64_t)display_dpi << 16) / 0x78;
++	const int64_t sens_factor = ((int64_t)sens << 16) / 10;
++
++	/* Scale x and y */
++	for (int i = 0; i < 5; i++) {
++		filter->x_scaled[i] = (smooth_mouse_x_curve[i] * 0x38000) >> 16;
++
++		const int64_t temp = (dpi_factor * smooth_mouse_y_curve[i]) >> 16;
++		filter->y_scaled[i] = (temp * sens_factor) >> 16;
++	}
++
++	/* Calculate slopes and y-intercepts */
++	for (int i = 0; i < 4; i++) {
++		const int64_t x1 = filter->x_scaled[i], x2 = filter->x_scaled[i + 1];
++		const int64_t y1 = filter->y_scaled[i], y2 = filter->y_scaled[i + 1];
++		const int64_t dx = x2 - x1;
++
++		int64_t slope = 0, y_intercept = y1;
++		if (dx) {
++			const int64_t dy = y2 - y1;
++			slope = (dy << 16) / dx;
++			y_intercept = y1 - ((slope * x1) >> 16);
++		}
++		filter->slopes[i] = slope;
++		filter->y_intercepts[i] = y_intercept;
++	}
++}
++
++/**
++ * Accelerates based on raw input.
++ * Same as win32kbase!CDeviceAcceleration::Accelerate
++ *
++ * @param filter The acceleration filter
++ * @param dx The raw delta x
++ * @param dy The raw delta y
++ * @return An accelerated tuple of coordinates
++ */
++static inline struct normalized_coords
++accelerate(struct pointer_accelerator_epp *filter, const double dx, const double dy)
++{
++	/* Scale dx and dy */
++	const int64_t x_fp = (int64_t)dx * 0x10000;
++	const int64_t y_fp = (int64_t)dy * 0x10000;
++
++	/* Calculate approximate euclidean distance */
++	const int64_t ax = x_fp >= 0 ? x_fp : -x_fp;
++	const int64_t ay = y_fp >= 0 ? y_fp : -y_fp;
++	const int64_t min_abs = ax < ay ? ax : ay;
++	const int64_t max_abs = ax > ay ? ax : ay;
++	const int64_t approx_dist = max_abs + (min_abs >> 1);
++
++	/* Get segment */
++	int64_t idx = 3;
++	for (int64_t i = 0; i < 3; i++) {
++		if (approx_dist <= filter->x_scaled[i + 1]) {
++			idx = i;
++			break;
++		}
++	}
++
++	/* Calculate gain */
++	int64_t gain = filter->slopes[idx];
++	if (approx_dist)
++		gain += (filter->y_intercepts[idx] << 16) / approx_dist;
++
++	/* Smoothing when crossing into a higher segment */
++	if (filter->prev_idx < idx) {
++		int64_t prev = filter->slopes[filter->prev_idx];
++		const int64_t pi = filter->y_intercepts[filter->prev_idx];
++		if (approx_dist)
++			prev += (pi << 16) / approx_dist;
++		gain = (gain + prev) >> 1;
++	}
++
++	/* Store segment */
++	filter->prev_idx = idx;
++
++	/* Apply gain and subpixel accumulation */
++	const int64_t x_tot = ((x_fp * gain) >> 16) + filter->x_accum;
++	const int64_t y_tot = ((y_fp * gain) >> 16) + filter->y_accum;
++
++	const int64_t qx = x_tot / (1LL << 16); /* q16.16 integer part */
++	const int64_t rx = x_tot % (1LL << 16); /* remainder */
++	const int64_t qy = y_tot / (1LL << 16);
++	const int64_t ry = y_tot % (1LL << 16);
++
++	filter->x_accum = rx;
++	filter->y_accum = ry;
++
++	struct normalized_coords accelerated = {
++		.x = (double)qx,
++		.y = (double)qy,
++	};
++
++	return accelerated;
++}
++
++static struct normalized_coords
++accelerator_filter_epp(struct motion_filter *filter,
++		       const struct device_float_coords *unaccelerated,
++		       void *data,
++		       usec_t time)
++{
++	struct pointer_accelerator_epp *accel =
++		(struct pointer_accelerator_epp *)filter;
++
++	return accelerate(accel, unaccelerated->x, unaccelerated->y);
++}
++
++static struct normalized_coords
++accelerator_filter_constant(struct motion_filter *filter,
++			    const struct device_float_coords *unaccelerated,
++			    void *data,
++			    usec_t time)
++{
++	struct normalized_coords norm;
++
++	norm.x = unaccelerated->x;
++	norm.y = unaccelerated->y;
++
++	return norm;
++}
++
++static struct normalized_coords
++accelerator_filter_scroll(struct motion_filter *filter,
++			  const struct device_float_coords *unaccelerated,
++			  void *data,
++			  usec_t time,
++			  enum filter_scroll_type type)
++{
++	return accelerator_filter_constant(filter, unaccelerated, data, time);
++}
++
++static void
++accelerator_destroy_epp(struct motion_filter *filter)
++{
++	struct pointer_accelerator_epp *accel =
++		(struct pointer_accelerator_epp *)filter;
++
++	free(accel);
++}
++
++static inline int
++to_windows_sens(const double speed)
++{
++	long s = lround((speed + 1.0) * 10.0);
++	if (s < 1)
++		s = 1;
++	if (s > 20)
++		s = 20;
++	return (int)s;
++}
++
++static bool
++accelerator_set_speed_epp(struct motion_filter *filter, double speed_adjustment)
++{
++	struct pointer_accelerator_epp *accel =
++		(struct pointer_accelerator_epp *)filter;
++	build_pointer_accelerator_curve_epp(accel,
++					    DEFAULT_DISPLAY_DPI,
++					    to_windows_sens(speed_adjustment));
++
++	return true;
++}
++
++static const struct motion_filter_interface accelerator_interface_epp = {
++	.type = LIBINPUT_CONFIG_ACCEL_PROFILE_EPP,
++	.filter = accelerator_filter_epp,
++	.filter_constant = accelerator_filter_constant,
++	.filter_scroll = accelerator_filter_scroll,
++	.restart = NULL,
++	.destroy = accelerator_destroy_epp,
++	.set_speed = accelerator_set_speed_epp,
++};
++
++struct motion_filter *
++create_pointer_accelerator_filter_epp(void)
++{
++	struct pointer_accelerator_epp *filter;
++
++	filter = zalloc(sizeof *filter);
++	filter->base.interface = &accelerator_interface_epp;
++
++	filter->x_accum = 0;
++	filter->y_accum = 0;
++	filter->prev_idx = 0;
++
++	build_pointer_accelerator_curve_epp(filter,
++					    DEFAULT_DISPLAY_DPI,
++					    DEFAULT_WINDOWS_SENS);
++
++	return &filter->base;
++}
+diff --git a/src/filter.h b/src/filter.h
+index 9609b16c..b29f460d 100644
+--- a/src/filter.h
++++ b/src/filter.h
+@@ -142,6 +142,9 @@ filter_set_accel_config(struct motion_filter *filter,
+ struct motion_filter *
+ create_pointer_accelerator_filter_flat(int dpi);
+ 
++struct motion_filter *
++create_pointer_accelerator_filter_epp(void);
++
+ struct motion_filter *
+ create_pointer_accelerator_filter_linear(int dpi, bool use_velocity_averaging);
+ 
+diff --git a/src/libinput.h b/src/libinput.h
+index ff206fba..be5572aa 100644
+--- a/src/libinput.h
++++ b/src/libinput.h
+@@ -5737,6 +5737,11 @@ enum libinput_config_accel_profile {
+ 	 * @see libinput_config_accel_set_points
+ 	 */
+ 	LIBINPUT_CONFIG_ACCEL_PROFILE_CUSTOM = (1 << 2),
++
++	/**
++	 * Windows Enhance Pointer Precision implementation.
++	 */
++	LIBINPUT_CONFIG_ACCEL_PROFILE_EPP = (1 << 3),
+ };
+ 
+ /**
